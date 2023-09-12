@@ -1,0 +1,761 @@
+---
+title: "Network Co-expression analysis"
+author: "Artemiy Dakhnovets"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning=FALSE)
+
+library(readr, quietly = TRUE)
+library(dplyr, quietly = TRUE)
+library(tibble, quietly = TRUE)
+library(readr, quietly = TRUE)
+library(DGCA, quietly = TRUE)
+library(matrixStats, quietly = TRUE)
+library(WGCNA, quietly = TRUE)
+library(ggplot2, quietly = TRUE)
+library(gplots, quietly = TRUE)
+library(ggplot2, quietly = TRUE)
+library(ggpubr, quietly = TRUE)
+library(gridExtra, quietly = TRUE)
+library(grid, quietly = TRUE)
+library(fdrtool, quietly = TRUE)
+library(mltools, quietly = TRUE)
+library(data.table, quietly = TRUE)
+library(BioNERO, quietly = TRUE)
+library(doParallel, quietly = TRUE)
+library(GOstats,quietly=TRUE)
+library(HGNChelper, quietly=TRUE)
+library(org.Hs.eg.db,quietly=TRUE)
+library(plotrix, quietly = TRUE)
+
+registerDoParallel(cores=10)
+set.seed(123)
+```
+
+
+```{r data loading}
+df <- read_csv("Immune_project/data/patients_abud_filtered_genfocus.csv") %>% 
+      column_to_rownames(var="gene")
+meta <- read_csv("Immune_project/data/response_metadata.csv")
+
+atezo_id <- meta[meta$ARM == "Atezo", ] %>% pull("subject_id")
+atezo_bev_id <- meta %>% filter(ARM == "Atezo+Bev") %>% pull("subject_id")
+sunitinib_id <- meta %>% filter(ARM == "Sunitinib") %>% pull("subject_id")
+
+atezo <- df[,intersect( atezo_id, colnames(df) )]
+atezo_bev <- df[,intersect( atezo_bev_id, colnames(df))]
+sunitinib <- df[,intersect( sunitinib_id, colnames(df))]
+```
+
+
+```{r model matrix atezo}
+atezo_response <- data.frame(subject_id = atezo_id, response = meta %>% filter(ARM == "Atezo") %>% pull("Response"))
+atezo_response$response <- ifelse(atezo_response$response == 0, "NoResponse", "Response")
+atezo_response$response <- as.factor(atezo_response$response)
+design_mat_atezo <- one_hot(as.data.table(atezo_response))[,2:3]
+colnames(design_mat_atezo) <- c("NoResponse", "Response")
+```
+
+
+```{r filterGenes2}
+filterGenes2 <- function(inputMat, filterTypes = "central",
+  keepRows = NULL, filterCentralType = "median",
+  filterDispersionType = "dispersion_index", filterCentralPercentile = 0.25,
+  filterDispersionPercentile = 0.25, sequential = FALSE, allGroups = FALSE,
+  design = NULL){
+
+  ##############################
+	#set SAF to FALSE while restoring to default when the function is finished
+	SAF = getOption("stringsAsFactors", FALSE)
+	on.exit(options(stringsAsFactors = SAF))
+	options(stringsAsFactors = FALSE)
+
+  if (!requireNamespace("matrixStats", quietly = TRUE)) {
+    stop("The library matrixStats is needed for the filtering function to work. Please install it.",
+      call. = FALSE)
+  }
+
+  if(!allGroups){
+
+    rows_above_central = rep(TRUE, nrow(inputMat))
+    if("central" %in% filterTypes){
+      if(filterCentralType == "mean"){
+        row_central = rowMeans(data.matrix(inputMat))
+      }
+      if(filterCentralType == "median"){
+        row_central = matrixStats::rowMedians(data.matrix(inputMat))
+      }
+      row_central_cutoff = quantile(row_central, filterCentralPercentile, na.rm = T)
+      rows_above_central = row_central > row_central_cutoff
+    }
+
+    if(!is.null(keepRows)){
+      rows_above_central = rows_above_central | rownames(inputMat) %in% keepRows
+    }
+
+    if(sequential){
+      inputMat = inputMat[rows_above_central, ]
+    }
+
+    rows_above_dispersion = rep(TRUE, nrow(inputMat))
+    if("dispersion" %in% filterTypes){
+      row_vars = matrixStats::rowVars(data.matrix(inputMat))
+      if(filterDispersionType == "dispersion_index"){
+        row_means = rowMeans(data.matrix(inputMat))
+        row_dispersion = row_vars/abs(row_means)
+      }
+      if(filterDispersionType == "cv"){
+        row_means = rowMeans(data.matrix(inputMat))
+        row_dispersion = sqrt(row_vars)/abs(row_means)
+      }
+      if(filterDispersionType == "variance"){
+        row_dispersion = row_vars
+      }
+      row_dispersion_cutoff = quantile(row_dispersion, filterDispersionPercentile, na.rm = T)
+      rows_above_dispersion = row_dispersion > row_dispersion_cutoff
+    }
+
+    if(!is.null(keepRows)){
+      rows_above_dispersion = rows_above_dispersion | rownames(inputMat) %in% keepRows
+    }
+
+    if(sequential){
+      rows_to_keep = rows_above_dispersion
+    } else {
+      rows_to_keep = rows_above_central & rows_above_dispersion
+    }
+
+  } else {
+
+    if(is.null(design)) stop("If allGroups == TRUE, then you must input a design matrix as well.")
+
+    designRes = getGroupsFromDesign(inputMat, design)
+    groupList = designRes[[1]]
+
+    for(i in 1:length(groupList)){
+
+      rows_above_central = rep(TRUE, nrow(groupList[[i]]))
+      if("central" %in% filterTypes){
+        if(filterCentralType == "mean"){
+          row_central = rowMeans(data.matrix(groupList[[i]]))
+        }
+        if(filterCentralType == "median"){
+          row_central = matrixStats::rowMedians(data.matrix(groupList[[i]]))
+        }
+        row_central_cutoff = quantile(row_central, filterCentralPercentile, na.rm = T)
+        rows_above_central = row_central > row_central_cutoff
+      }
+
+      if(!is.null(keepRows)){
+        rows_above_central = rows_above_central | rownames(groupList[[i]]) %in% keepRows
+      }
+
+      if(sequential){
+        groupList[[i]] = groupList[[i]][rows_above_central, ]
+      }
+
+      rows_above_dispersion = rep(TRUE, nrow(groupList[[i]]))
+      if("dispersion" %in% filterTypes){
+        row_vars = matrixStats::rowVars(data.matrix(groupList[[i]]))
+        if(filterDispersionType == "dispersion_index"){
+          row_means = rowMeans(data.matrix(groupList[[i]]))
+          row_dispersion = row_vars/abs(row_means)
+        }
+        if(filterDispersionType == "cv"){
+          row_means = rowMeans(data.matrix(groupList[[i]]))
+          row_dispersion = sqrt(row_vars)/abs(row_means)
+        }
+        if(filterDispersionType == "variance"){
+          row_dispersion = row_vars
+        }
+        row_dispersion_cutoff = quantile(row_dispersion, filterDispersionPercentile, na.rm = T)
+        rows_above_dispersion = row_dispersion > row_dispersion_cutoff
+      }
+
+      if(!is.null(keepRows)){
+        rows_above_dispersion = rows_above_dispersion | rownames(groupList[[i]]) %in% keepRows
+      }
+
+      if(i == 1){
+        if(sequential){
+          rows_to_keep = rows_above_dispersion
+        } else {
+          rows_to_keep = rows_above_central & rows_above_dispersion
+        }
+      } else {
+        if(sequential){
+          rows_to_keep = rows_above_dispersion & rows_to_keep
+        } else {
+          rows_to_keep = rows_above_central & rows_above_dispersion & rows_to_keep
+        }
+      }
+
+    }
+
+  }
+
+  filteredMat = inputMat[rows_to_keep, ]
+
+  return(filteredMat)
+
+}
+```
+
+
+```{r filter genes atezo}
+nrow(atezo)
+atezo_mean_filtered <- filterGenes2(atezo, 
+  filterTypes = c("central","dispersion"), filterCentralType = "median", filterCentralPercentile = 0.25,
+  filterDispersionType = "cv", 
+  filterDispersionPercentile = 0.25)
+nrow(atezo_mean_filtered)
+
+#sample filtration
+atezo_mean_filtered <- ZKfiltering(atezo_mean_filtered, cor_method = "spearman")
+```
+
+
+```{r check samples and genes if outliers via gsg}
+gsg <- goodSamplesGenes(t(atezo_mean_filtered))
+summary(gsg)
+table(gsg$goodGenes)
+table(gsg$goodSamples)
+```
+
+```{r check hierarchical clusterization of samples in atezo, fig.height=8, fig.width=13}
+htree <- hclust( dist( t( atezo_mean_filtered ) ), method = "average" )
+plot(htree)
+```
+
+
+```{r BioNERO based atezo filtering}
+# atezo_gene_filtered2 <- remove_nonexp(atezo, method = "percentage", min_exp = 0.1, min_percentage_samples = 0.75)
+# atezo_gene_filtered2 <- filter_by_variance(atezo_gene_filtered2, n = 7000)
+# atezo_gene_filtered2 <- ZKfiltering(atezo_gene_filtered2, cor_method = "spearman")
+# atezo_gene_filtered2 <- PC_correction(atezo_gene_filtered2, verbose = T)
+```
+
+# BioNERO based module identification in atezolizumab data
+## Construct co-expression network for atezo before PCA correction
+
+```{r pairwise sample correlation heatmap before PCA based correction, fig.height=9, fig.width=11}
+p <- plot_heatmap(atezo_mean_filtered, type = "samplecor",
+                  show_rownames = FALSE, col_metadata = atezo_response)
+p
+```
+
+
+```{r gene expr heatmap before PCA based correction}
+p <- plot_heatmap(
+    atezo_mean_filtered[1:50, ], type = "expr", show_rownames = FALSE,
+    show_colnames = FALSE, col_metadata = atezo_response
+)
+p
+```
+
+
+```{r atezo samples' PCA before PCA based correction}
+plot_PCA(atezo_mean_filtered, metadata = atezo_response)
+```
+
+
+```{r pick soft-threshold for atezo without PCA correction}
+sft_atezo_bioNERO <- SFT_fit(atezo_mean_filtered)
+sft_atezo_bioNERO$power
+sft_atezo_bioNERO$plot
+```
+
+
+```{r build co-expr. network for atezo without PCA correct.}
+net_atezo <- exp2gcn(
+    atezo_mean_filtered, SFTpower = 20, 
+    cor_method = "spearman", module_merging_threshold = 0.8
+)
+
+names(net_atezo)
+net_atezo$genes_and_modules %>% as.tibble() %>% dplyr::count(., Modules, sort = TRUE)
+```
+
+
+```{r module distribution for atezo without PCA correct.}
+plot_ngenes_per_module(net_atezo)
+```
+
+```{r plot atezo with PCA correction cluster dendrogram, fig.height=4, fig.width=8 }
+plot_dendro_and_colors(net_atezo)
+```
+
+## Construct co-expression network for atezo after PCA correction
+
+```{r filter genes atezo}
+nrow(atezo)
+atezo_mean_filtered_PC <- filterGenes2(atezo, 
+  filterTypes = c("central","dispersion"), filterCentralType = "median", filterCentralPercentile = 0.25,
+  filterDispersionType = "cv", 
+  filterDispersionPercentile = 0.25)
+nrow(atezo_mean_filtered_PC)
+
+#optional filtration
+atezo_mean_filtered_PC <- ZKfiltering(atezo_mean_filtered_PC, cor_method = "spearman")
+atezo_mean_filtered_PC <- PC_correction(atezo_mean_filtered_PC, verbose = T) %>%
+  as.data.frame()
+```
+
+
+```{r pairwise sample correlation heatmap after PCA based correction, fig.height=9, fig.width=11}
+p <- plot_heatmap(atezo_mean_filtered_PC, type = "samplecor",
+                  show_rownames = FALSE, col_metadata = atezo_response)
+p
+```
+
+
+```{r gene expr heatmap after PCA based correction}
+p <- plot_heatmap(
+    atezo_mean_filtered_PC[1:50, ], type = "expr", show_rownames = FALSE,
+    show_colnames = FALSE, col_metadata = atezo_response
+)
+p
+```
+
+
+```{r atezo samples' PCA after PCA based correction}
+plot_PCA(atezo_mean_filtered_PC, metadata = atezo_response)
+```
+
+
+```{r pick soft-threshold with PCA correction}
+sft_atezo_PC <- SFT_fit(atezo_mean_filtered_PC)
+sft_atezo_PC$power
+```
+
+
+```{r soft-threshold graph with PCA correction, fig.height=4, fig.width=8}
+soft_power_PC <- sft_atezo_PC$power
+sft_atezo_PC$plot
+```
+
+
+```{r build gene co-expression network for atezo with PCA correction}
+net_atezo_PC <- exp2gcn(
+    atezo_mean_filtered_PC, SFTpower = soft_power_PC, 
+    cor_method = "spearman", module_merging_threshold = 0.8
+)
+
+names(net_atezo_PC)
+net_atezo_PC$genes_and_modules %>% as.tibble() %>% dplyr::count(., Modules, sort = TRUE)
+```
+
+
+```{r plot atezo with PCA correction cluster dendrogram, fig.height=4, fig.width=8 }
+plot_dendro_and_colors(net_atezo_PC)
+```
+
+
+```{r eigengene network for atezo with PCA correction, fig.height=8, fig.width=7}
+plot_eigengene_network(net_atezo_PC)
+```
+
+
+```{r module distribution for atezo with PCA correct., fig.height=5, fig.width=7}
+plot_ngenes_per_module(net_atezo_PC)
+```
+
+
+```{r plot expression profile for module yellow obtained from atezo with PCA correction,fig.height=4, fig.width=10}
+plot_expression_profile(
+    exp = atezo_mean_filtered_PC, 
+    net = net_atezo_PC,
+    metadata = atezo_response,
+    plot_module = TRUE, 
+    modulename = "yellow"
+)
+```
+
+
+```{r plot expression profile for module brown4 obtained from atezo with PCA correction,fig.height=4, fig.width=10}
+plot_expression_profile(
+    exp = atezo_mean_filtered_PC, 
+    net = net_atezo_PC,
+    metadata = atezo_response,
+    plot_module = TRUE, 
+    modulename = "brown4"
+)
+```
+
+
+## Module-based differential correlation analysis of atezo data after PCA based correction
+
+
+```{r module-based dif. cor. analysis of atezo with PCA correct.}
+gnm_atezo_PC <- net_atezo_PC$genes_and_modules %>% filter(!Modules == "grey")
+moduleDC_atezo_PC <- moduleDC(inputMat = atezo_mean_filtered_PC,
+                              design = as.matrix(design_mat_atezo),
+                              compare = c("NoResponse", "Response"),
+                              genes = gnm_atezo_PC$Genes,
+                              labels = gnm_atezo_PC$Modules,
+                              nPerms = 50,
+                              number_DC_genes = 5,
+                              dCorAvgMethod = "median",
+                              corrType = "spearman"
+                              )
+head(moduleDC_atezo_PC[order(moduleDC_atezo_PC$pVal, decreasing = FALSE), ])
+```
+
+
+```{r compare dif. cor. strength of genes in module green in PCA corrected atezo}
+green_genes <- gnm_atezo_PC %>%
+  filter(Modules == "green") %>%
+  pull(var = "Genes")
+atezo_green_PC <- atezo_mean_filtered_PC[green_genes,]
+moduleDC_atezo_green_PC <- ddcorAll(inputMat = atezo_green_PC,
+                              design = as.matrix(design_mat_atezo),
+                              compare = c("NoResponse", "Response"),
+                              nPerms = 300,
+                              getDCorAvg = TRUE,
+                              dCorAvgType = "gene_average",
+                              dCorAvgMethod = "median",
+                              corrType = "spearman"
+                              )
+moduleDC_atezo_green_PC_df <- moduleDC_atezo_green_PC[["avg_dcor"]]
+head(moduleDC_atezo_green_PC_df[order(moduleDC_atezo_green_PC_df$pVal_adj, decreasing = FALSE), ])
+```
+
+
+```{r compare dif. cor. strength of genes in module ivory in PCA corrected atezo}
+ivory_genes <- gnm_atezo_PC %>%
+  filter(Modules == "ivory") %>%
+  pull(var = "Genes")
+atezo_ivory_PC <- atezo_mean_filtered_PC[ivory_genes,]
+moduleDC_atezo_ivory_PC <- ddcorAll(inputMat = atezo_ivory_PC,
+                              design = as.matrix(design_mat_atezo),
+                              compare = c("NoResponse", "Response"),
+                              nPerms = 300,
+                              getDCorAvg = TRUE,
+                              dCorAvgType = "gene_average",
+                              dCorAvgMethod = "median",
+                              corrType = "spearman"
+                              )
+moduleDC_atezo_ivory_PC_df <- moduleDC_atezo_ivory_PC[["avg_dcor"]]
+head(moduleDC_atezo_ivory_PC_df[order(moduleDC_atezo_ivory_PC_df$pVal_adj, decreasing = FALSE), ])
+```
+
+
+```{r GO analysis of modules obtained from PCA atezo}
+moduleGO_res_atezo_PC <- moduleGO(genes = gnm_atezo_PC$Genes,
+             labels = gnm_atezo_PC$Modules,
+             universe = rownames(atezo_mean_filtered_PC),
+             HGNC_clean = TRUE,
+             HGNC_switch = TRUE)
+```
+
+
+```{r extract GO results}
+moduleGO_df_atezo_PC <- extractModuleGO(moduleGO_res_atezo_PC)
+head(moduleGO_df_atezo_PC)
+```
+
+
+```{r visualize GO results,fig.height=10, fig.width=23}
+plotModuleGO(moduleGO_df_atezo_PC, nTerms = 5,
+             text_size = 14, coord_flip = TRUE)
+```
+
+
+# WGCNA-based stepwise module analysis of PCA corrected atezo data
+
+```{r}
+temp_cor <- cor
+cor <- WGCNA::cor
+```
+
+
+```{r Step 1. Pick a soft-threshold, fig.height=4, fig.width=10}
+power <- c(1:10, seq(from = 12, to = 22, by = 2))
+sft_atezo_PC <- pickSoftThreshold(atezo_mean_filtered_PC,
+                  powerVector = power,
+                  networkType = "signed",
+                  verbose = 5,
+                  corOptions = list(use = 'p', method = 'spearman'))
+sft_atezo.data.PC <- sft_atezo_PC$fitIndices
+
+a1 <- ggplot(sft_atezo.data.PC, aes(Power, SFT.R.sq, label = Power))+
+  geom_point()+
+  geom_text(nudge_y = 0.1)+
+  geom_hline(yintercept = 0.8, color = "red")+
+  labs(x = "", y = "Scale free topology model fit, signed R^2")+
+  theme_classic()
+
+a2 <- ggplot(sft_atezo.data.PC, aes(Power, mean.k., label = Power))+
+  geom_point()+
+  geom_text(nudge_y = 0.2)+
+  labs(x = "Power", y = "Mean connectivity")+
+  theme_classic()
+
+grid.arrange(a1, a2, ncol = 2)
+```
+
+
+```{r Step 2. Build adjacency matrix}
+soft.power.PC <- 6
+adjacency_atezo_PC <- adjacency(datExpr = as.data.frame(t(atezo_mean_filtered_PC)),
+                                type = "signed",
+                                power = soft.power.PC,
+                                corOptions = list(use = 'p', method = 'spearman'))
+```
+
+
+```{r Step 3. Build TOM}
+TOM_atezo_PC = TOMsimilarity(adjacency_atezo_PC, TOMType = "signed")
+dissTOM_atezo_PC = 1-TOM_atezo_PC
+```
+
+
+```{r Step 4. Clustering using TOM}
+# Call the hierarchical clustering function
+geneTree <- hclust(as.dist(dissTOM_atezo_PC), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+labels = FALSE, hang = 0.04);
+```
+
+
+```{r Step 5a. Module identification}
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 30;
+# Module identification using dynamic tree cut:
+dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM_atezo_PC,
+                             deepSplit = 2, pamRespectsDendro = FALSE,
+                             minClusterSize = minModuleSize);
+table(dynamicMods)
+```
+
+
+```{r Step 5b. Module visualization}
+# Convert numeric lables into colors
+dynamicColors <- labels2colors(dynamicMods)
+table(dynamicColors)
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Unmerged",
+                    dendroLabels = FALSE, hang = 0.03, 
+                    addGuide = TRUE, guideHang = 0.05, 
+                    main = "Gene dendrogram and module colors.\n PCA corrected atezo")
+```
+
+
+```{r Step 6. Merge similar modules}
+# Calculate eigengenes
+MEList <- moduleEigengenes(as.data.frame(t(atezo_mean_filtered_PC)), colors = dynamicColors)
+MEs <- MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss <- 1-cor(MEs);
+# Cluster module eigengenes
+METree <- hclust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes", 
+     xlab = "", sub = "")
+MEDissThres <- 0.25
+# Plot the cut line into the dendrogram
+abline(h = MEDissThres, col = "red")
+# Call an automatic merging function
+merge <- mergeCloseModules(as.data.frame(t(atezo_mean_filtered_PC)), dynamicColors, cutHeight = MEDissThres, verbose = 3)
+# The merged module colors
+mergedColors <- merge$colors;
+# Eigengenes of the new merged modules:
+mergedMEs <- merge$newMEs;
+```
+
+
+```{r}
+sizeGrWindow(12, 9)
+#pdf(file = "Plots/geneDendro-3.pdf", wi = 9, he = 6)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors), 
+                    c("Unmerged", "Merged"), 
+                    dendroLabels = FALSE, hang = 0.03, 
+                    addGuide = TRUE, guideHang = 0.05)
+#dev.off()
+```
+
+
+```{r}
+# Rename to moduleColors
+moduleColors <- mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder <- c("grey", standardColors(50))
+moduleLabels <- match(moduleColors, colorOrder)-1
+MEs <- mergedMEs
+table(moduleColors)
+```
+
+
+# GO enrichment analysis of differentially correlated gene pairs obtained from PCA corrected atezo data 
+
+```{r Dif. cor. analysis of all genes with BH correction}
+ddcor_res_BH_atezo_PC <- ddcorAll(inputMat = atezo_mean_filtered_PC, design = as.matrix(design_mat_atezo),
+  compare = c("NoResponse", "Response"),
+  adjust = "BH", heatmapPlot = F, nPerm = 0, corrType = "spearman", nPairs = 5000)
+ddcor_res_BH_atezo_PC <- as.data.frame(ddcor_res_BH_atezo_PC)
+head(ddcor_res_BH_atezo_PC[order(ddcor_res_BH_atezo_PC$pValDiff_adj, decreasing = FALSE), ], 10)
+```
+
+
+```{r check correlations}
+atezo_NoResponse_ids <- atezo_response %>% filter(atezo_response$response == "NoResponse") %>% rownames(.)
+BTBD8_NoResponse <- atezo_mean_filtered_PC[,atezo_NoResponse_ids] %>% filter(rownames(atezo_mean_filtered_PC) == "BIRC7")%>%
+  t(.) %>% as.data.frame(.) %>% pull(BIRC7)
+
+APH1A_NoResponse <- atezo_mean_filtered_PC[,atezo_NoResponse_ids] %>% filter(rownames(atezo_mean_filtered_PC) == "PCDH10")%>%
+  t(.) %>% as.data.frame(.) %>% pull(PCDH10)
+
+print(stats::cor(BTBD8_NoResponse, APH1A_NoResponse, method = "spearman"))
+rm(atezo_NoResponse_ids, BTBD8_NoResponse, APH1A_NoResponse)
+```
+
+
+```{r GO analysis of ddcorall results for atezo PCA correct.}
+ddcorGO_res_atezo_PC = ddcorGO(ddcor_res_BH_atezo_PC, universe = rownames(atezo_mean_filtered_PC), 
+  gene_ontology = "all", HGNC_clean = TRUE, HGNC_switch = TRUE,
+  annotation = "org.Hs.eg.db", calculateVariance = TRUE,
+  adjusted = TRUE, classes = TRUE, unique_genes = TRUE)
+```
+
+
+```{r cor plot of ADGRD1 and TRAV21 from PCA non-correct. atezo data}
+plCor1 <- plotCors(inputMat = atezo_mean_filtered, design = as.matrix(design_mat_atezo),
+         compare = c("NoResponse", "Response"),
+          geneA = "MROH7", geneB = "TIPARP", corrType = "spearman")
+plCor2 <- plotCors(inputMat = atezo_mean_filtered, design = as.matrix(design_mat_atezo),
+         compare = c("NoResponse", "Response"),
+         geneA = "APOBEC2", geneB = "LURAP1L", corrType = "spearman")
+
+ggarrange(plCor1, plCor2, 
+          labels = c("A", "B"),
+          ncol = 1, nrow = 2)
+```
+
+
+```{r cor plot of ADGRD1 and TRAV21 from PCA correct. atezo data}
+plCor3 <- plotCors(inputMat = atezo_mean_filtered_PC, design = as.matrix(design_mat_atezo),
+         compare = c("NoResponse", "Response"),
+         geneA = "MROH7", geneB = "TIPARP", corrType = "spearman")
+plCor4 <- plotCors(inputMat = atezo_mean_filtered_PC, design = as.matrix(design_mat_atezo),
+         compare = c("NoResponse", "Response"),
+         geneA = "APOBEC2", geneB = "LURAP1L", corrType = "spearman")
+
+ggarrange(plCor3, plCor4, 
+          labels = c("C", "D"),
+          ncol = 1, nrow = 2)
+```
+
+
+```{r GO ench. bar plot of positive in NoRespone, negative in Response groups}
+plotGOOneGroup2(dfList = ddcorGO_res_atezo_PC[["enrichment_significant_pos_neg_genes"]],
+               maxSize = 600, adjustPVals = TRUE)
+```
+
+
+```{r GO ench. bar plot of negative in NoRespone, positive in Response groups}
+plotGOOneGroup2(dfList = ddcorGO_res_atezo_PC[["enrichment_significant_neg_pos_genes"]],
+               maxSize = 600, adjustPVals = TRUE)
+```
+
+
+```{r,fig.height=10, fig.width=15}
+plotGOTwoGroups(dfList1 = ddcorGO_res_atezo_PC[["enrichment_significant_pos_neg_genes"]],
+                dfList2 = ddcorGO_res_atezo_PC[["enrichment_significant_neg_pos_genes"]],
+                minSize = 50, maxSize = 600,
+                labels = c("NoResponse ρ > Response ρ",
+                           "GO Term Name",
+                           "NoResponse ρ < Response ρ"))
+```
+
+```{r plotGOOneGroup2 function}
+#' @title Plot results from a hypergeometric enrichment test for one condition.
+#' @description Uses ggplot2 to create a horizontal bar plot of the p-values (or odds-ratios) from enrichment tests of GO terms derived from differentially correlated gene sets (or any gene sets inputted into upstream functions). Note that the first column of each data frame is removed to allow for row binding, and otherwise the column names should match.
+#' @param dfList A named list of data frames corresponding to different GO term enrichments.
+#' @param nTerms The number of most-enriched terms to plot from each GO term type.
+#' @param minSize The number of genes above which a gene set should be removed from analysis (e.g., because it is so small as to be overly specific and untrustworthy).
+#' @param maxSize The number of genes above which a gene set should be removed from analysis (e.g., because it is so big as to be overly generic and relatively uninteresting).
+#' @param dataCol Column of the input matrix to be plotted in the bar plot. If "Pvalue", it will be -log10 transformed prior to plotting. If not "Pvalue", the x-axis label should be changed manually following the function call.
+#' @param namesCol The column specifying the name of the GO terms to be plotted.
+#' @param labelsCol The column specifying the fill labels of the GO terms to be plotted.
+#' @param legendTitle The title for the legend in the resulting plot.
+#' @param adjustPVals Logical, indicating whether or not p-values should be adjusted by the Benjamini-Hochberg method.
+#' @return An ggplot2 object that can be called in order to plot it, saved, or modified.
+#' @export
+plotGOOneGroup2 <- function(dfList, nTerms = 5, minSize = 50, maxSize = 500, dataCol = "Pvalue",
+  namesCol = "Term", labelsCol = "Ontology", legendTitle = "GO Type", adjustPVals = FALSE){
+
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("The R package ggplot2 is needed for this function to work. Please install it.",
+      call. = FALSE)
+  }
+
+  ##############################
+  #set SAF to FALSE while restoring to default when the function is finished
+  SAF = getOption("stringsAsFactors", FALSE)
+  on.exit(options(stringsAsFactors = SAF))
+  options(stringsAsFactors = FALSE)
+
+  for(i in 1:length(dfList)){
+    tmp = dfList[[i]]
+    if(adjustPVals){
+      tmp$Pvalue = p.adjust(tmp$Pvalue, method = "BH")
+    }
+    tmp = tmp[tmp$Size > minSize, ]
+    tmp = tmp[tmp$Size < maxSize, ]
+    #remove the GO ID column to enable row binding
+    tmp = tmp[ , -1]
+    tmp = tmp[order(tmp[ , dataCol], decreasing = FALSE), ]
+    tmp = head(tmp, nTerms)
+    tmp = tmp[order(tmp[ , dataCol], decreasing = TRUE), ]
+    dfList[[i]] = tmp
+  }
+
+  data_df = rbind(dfList[[1]], dfList[[2]], dfList[[3]])
+
+  if(dataCol == "Pvalue"){
+    data_df[ , dataCol] = -log(data_df[ , dataCol], 10)
+  }
+
+  data_df[ , namesCol] = factor(data_df[ , namesCol], levels = data_df[ , namesCol])
+  data_df[ , labelsCol] = factor(data_df[ , labelsCol], levels = unique(data_df[ , labelsCol]))
+
+  cbPalette = c("#CC79A7", "#E69F00", "#56B4E9")
+  go_plot = ggplot2::ggplot(data_df, ggplot2::aes(x = get(namesCol), y = get(dataCol), fill = get(labelsCol))) +
+    ggplot2::geom_bar(stat = 'identity') + ggplot2::ylab("") + ggplot2::xlab("") +
+    ggplot2::coord_flip() + ggplot2::theme_bw() +
+    ggplot2::theme(axis.line = ggplot2::element_line(colour = "black"),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.border = ggplot2::element_blank(),
+    panel.background = ggplot2::element_blank()) +
+    ggplot2::scale_fill_manual(values = cbPalette, guide = ggplot2::guide_legend(title = "", reverse = TRUE)) +
+    ggplot2::guides(fill = ggplot2::guide_legend(title = legendTitle))
+
+  if(dataCol == "Pvalue"){
+    go_plot = go_plot + ggplot2::ylab(expression(paste("-Log"[10], " p-Value", sep = " ")))
+  }
+
+  return(go_plot)
+
+}
+```
+
+
+
+
+
+
+
+
+
+
+
